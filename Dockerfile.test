@@ -1,0 +1,33 @@
+# ============================================================
+# Dockerfile.test — CI test runner image (includes dev deps)
+# ============================================================
+
+FROM php:8.3-cli-alpine
+
+RUN apk add --no-cache \
+      curl \
+      git \
+      unzip \
+      libzip-dev \
+      icu-dev \
+      sqlite \
+    && docker-php-ext-install \
+      pdo_sqlite \
+      zip \
+      intl \
+    && pecl install xdebug \
+    && docker-php-ext-enable xdebug
+
+# Xdebug coverage mode
+RUN echo "xdebug.mode=coverage" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+
+COPY --from=composer:2.7 /usr/bin/composer /usr/bin/composer
+
+WORKDIR /app
+COPY . .
+
+RUN mkdir -p coverage storage/logs storage/framework/{cache/data,sessions,views} bootstrap/cache \
+    && chmod -R 777 storage bootstrap/cache
+
+ENTRYPOINT []
+CMD ["php", "artisan", "test"]

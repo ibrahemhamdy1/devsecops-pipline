@@ -1,0 +1,14 @@
+title = "Laravel Gitleaks Config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "laravel-app-key"
+description = "Laravel APP_KEY"
+regex = '''base64:[a-zA-Z0-9+/]{43}='''
+tags = ["laravel", "secret"]
+
+[[allowlist]]
+description = "Ignore test APP_KEY"
+regexes = ['''base64:aSampleKeyFor32CharsExactlyHere=''']

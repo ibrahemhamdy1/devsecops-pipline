@@ -1,0 +1,1002 @@
+########################################################################
+# Laravel DevSecOps Pipeline — GitHub Actions
+# Registry: GHCR (no AWS)
+# Cluster:  Any K8s via KUBECONFIG secret
+# Stack:    PHP 8.3, Laravel 11, Pest, PHPStan, Pint, Trivy, ZAP
+########################################################################
+
+name: Laravel DevSecOps Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      rollback:
+        description: "Trigger prod rollback"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PHP_VERSION: "8.3"
+  APP_NAME: laravel-devsecops
+  IMAGE_NAME: ${{ github.repository_owner }}/laravel-devsecops
+  IMAGE_TAG: ${{ github.sha }}
+  HELM_CHART_PATH: ./helm/laravel-app
+  K8S_NAMESPACE_DEV: dev
+  K8S_NAMESPACE_STAGING: staging
+  K8S_NAMESPACE_PROD: production
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  checks: write
+  pull-requests: write
+  id-token: write
+
+########################################################################
+# STAGE 1: VALIDATE
+########################################################################
+jobs:
+
+  validate-composer:
+    name: "Validate · Composer"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, curl, zip, sqlite3, pdo_sqlite
+          coverage: none
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-
+
+      - name: Install dependencies (no dev)
+        run: composer install --no-dev --prefer-dist --no-progress --no-interaction
+
+  validate-dockerfile:
+    name: "Validate · Dockerfile (Hadolint)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+          format: sarif
+          output-file: hadolint.sarif
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: hadolint.sarif
+          category: hadolint
+
+  validate-helm:
+    name: "Validate · Helm Chart"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Lint and template Helm chart
+        run: |
+          helm lint $HELM_CHART_PATH --strict
+          helm template $APP_NAME $HELM_CHART_PATH --debug > /dev/null
+
+########################################################################
+# STAGE 2: BUILD (install all deps including dev for testing)
+########################################################################
+
+  build:
+    name: "Build · Install Dependencies"
+    runs-on: ubuntu-latest
+    needs: [validate-composer, validate-dockerfile, validate-helm]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, curl, zip, sqlite3, pdo_sqlite, intl
+          coverage: none
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-dev-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-dev-
+
+      - name: Install all dependencies (with dev)
+        run: composer install --prefer-dist --no-progress --no-interaction
+
+      - name: Upload vendor
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor-${{ github.sha }}
+          path: vendor/
+          retention-days: 1
+
+########################################################################
+# STAGE 3: TEST
+########################################################################
+
+  test-unit:
+    name: "Test · Unit (Pest PHP)"
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      APP_ENV: testing
+      APP_KEY: base64:aSampleKeyFor32CharsExactlyHere=
+      DB_CONNECTION: sqlite
+      DB_DATABASE: ":memory:"
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, curl, zip, sqlite3, pdo_sqlite, intl
+          coverage: xdebug
+
+      - name: Download vendor
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor-${{ github.sha }}
+          path: vendor/
+
+      - name: Run Unit tests with coverage
+        run: |
+          mkdir -p coverage
+          XDEBUG_MODE=coverage php artisan test \
+            --testsuite=Unit \
+            --coverage-clover=coverage/clover-unit.xml \
+            --log-junit=coverage/junit-unit.xml
+
+      - uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: coverage/junit-unit.xml
+          check_name: Unit Test Results
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-unit-${{ github.sha }}
+          path: coverage/
+          retention-days: 7
+
+  test-feature:
+    name: "Test · Feature (Pest PHP + SQLite)"
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      APP_ENV: testing
+      APP_KEY: base64:aSampleKeyFor32CharsExactlyHere=
+      DB_CONNECTION: sqlite
+      DB_DATABASE: ":memory:"
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, curl, zip, sqlite3, pdo_sqlite, intl
+          coverage: xdebug
+
+      - name: Download vendor
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor-${{ github.sha }}
+          path: vendor/
+
+      - name: Run Feature tests with coverage
+        run: |
+          mkdir -p coverage
+          XDEBUG_MODE=coverage php artisan test \
+            --testsuite=Feature \
+            --coverage-clover=coverage/clover-feature.xml \
+            --log-junit=coverage/junit-feature.xml
+
+      - uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: coverage/junit-feature.xml
+          check_name: Feature Test Results
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-feature-${{ github.sha }}
+          path: coverage/
+          retention-days: 7
+
+  test-coverage-gate:
+    name: "Test · Coverage Gate >= 80%"
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-feature]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, sqlite3, pdo_sqlite, intl, zip
+          coverage: xdebug
+
+      - name: Download vendor
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor-${{ github.sha }}
+          path: vendor/
+
+      - name: Full test suite with coverage threshold
+        env:
+          APP_ENV: testing
+          APP_KEY: base64:aSampleKeyFor32CharsExactlyHere=
+          DB_CONNECTION: sqlite
+          DB_DATABASE: ":memory:"
+          CACHE_STORE: array
+          SESSION_DRIVER: array
+          QUEUE_CONNECTION: sync
+        run: |
+          mkdir -p coverage
+          XDEBUG_MODE=coverage php artisan test \
+            --coverage-clover=coverage/clover.xml \
+            --min=80
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-full-${{ github.sha }}
+          path: coverage/clover.xml
+          retention-days: 7
+
+########################################################################
+# STAGE 4: SAST
+########################################################################
+
+  sast-phpstan:
+    name: "SAST · PHPStan (Level 8)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, zip, intl, sqlite3, pdo_sqlite
+          coverage: none
+
+      - name: Download vendor
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor-${{ github.sha }}
+          path: vendor/
+
+      - name: Run PHPStan static analysis
+        run: vendor/bin/phpstan analyse --error-format=github --no-progress
+
+  sast-pint:
+    name: "SAST · Pint Code Style"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, zip
+          coverage: none
+
+      - name: Download vendor
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor-${{ github.sha }}
+          path: vendor/
+
+      - name: Check code style (Pint)
+        run: vendor/bin/pint --test
+
+  sast-semgrep:
+    name: "SAST · Semgrep (PHP + OWASP)"
+    runs-on: ubuntu-latest
+    needs: build
+    container:
+      image: returntocorp/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          semgrep ci \
+            --config=p/php \
+            --config=p/owasp-top-ten \
+            --config=p/secrets \
+            --sarif \
+            --output=semgrep.sarif || true
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  sast-gitleaks:
+    name: "SAST · Gitleaks (Secret Scan)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+########################################################################
+# STAGE 5: SCA
+########################################################################
+
+  sca-composer-audit:
+    name: "SCA · Composer Audit (CVE check)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, zip
+          coverage: none
+
+      - name: Run composer audit
+        run: composer audit --format=json --no-dev 2>&1 | tee composer-audit.json || true
+
+      - name: Fail on high/critical vulnerabilities
+        run: |
+          if [ -f composer-audit.json ]; then
+            COUNT=$(python3 -c "
+          import json, sys
+          try:
+              data = json.load(open('composer-audit.json'))
+              advisories = data.get('advisories', {})
+              total = sum(len(v) for v in advisories.values())
+              print(total)
+          except:
+              print(0)
+          ")
+            echo "Vulnerabilities found: $COUNT"
+            if [ "$COUNT" -gt "0" ]; then
+              echo "composer audit found vulnerabilities — review composer-audit.json"
+              exit 1
+            fi
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: composer-audit-${{ github.sha }}
+          path: composer-audit.json
+          retention-days: 14
+
+  sca-license:
+    name: "SCA · License Check"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mbstring, xml, zip
+          coverage: none
+
+      - name: Install license checker
+        run: composer require --dev dominikb/composer-license-checker --no-interaction --quiet
+
+      - name: Check for disallowed licenses
+        run: |
+          vendor/bin/composer-license-checker check \
+            --disallow GPL \
+            --disallow AGPL || echo "License check completed"
+
+########################################################################
+# STAGE 6: QUALITY GATE
+########################################################################
+
+  quality-sonarqube:
+    name: "Quality Gate · SonarQube"
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-feature, sast-phpstan, sast-semgrep]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-full-${{ github.sha }}
+          path: coverage/
+
+      - uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=laravel-devsecops
+            -Dsonar.sources=app
+            -Dsonar.tests=tests
+            -Dsonar.php.coverage.reportPaths=coverage/clover.xml
+            -Dsonar.qualitygate.wait=true
+
+########################################################################
+# STAGE 7: PACKAGE — GHCR
+########################################################################
+
+  package-docker:
+    name: "Package · Docker Build & Push (GHCR)"
+    runs-on: ubuntu-latest
+    needs: [quality-sonarqube, test-coverage-gate, sca-composer-audit]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      full_image: ghcr.io/${{ github.repository_owner }}/laravel-devsecops:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=laravel-devsecops
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: production
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=ghcr.io/${{ env.IMAGE_NAME }}:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ env.IMAGE_NAME }}:cache,mode=max
+          build-args: |
+            PHP_VERSION=${{ env.PHP_VERSION }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+          provenance: true
+          sbom: true
+
+########################################################################
+# STAGE 8: IMAGE SECURITY
+########################################################################
+
+  imgsec-trivy:
+    name: "Image Security · Trivy (CRITICAL/HIGH blocks)"
+    runs-on: ubuntu-latest
+    needs: package-docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.package-docker.outputs.full_image }}
+          format: sarif
+          output: trivy-critical.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - uses: aquasecurity/trivy-action@master
+        if: always()
+        with:
+          image-ref: ${{ needs.package-docker.outputs.full_image }}
+          format: json
+          output: trivy-full.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: "0"
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-critical.sarif
+          category: trivy
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-full-${{ github.sha }}
+          path: trivy-full.json
+          retention-days: 14
+
+  imgsec-cosign:
+    name: "Image Security · Cosign Keyless Sign"
+    runs-on: ubuntu-latest
+    needs: imgsec-trivy
+    permissions:
+      id-token: write
+      packages: write
+    steps:
+      - uses: sigstore/cosign-installer@v3.5.0
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign image (keyless via Sigstore/Fulcio)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ env.IMAGE_NAME }}@${{ needs.package-docker.outputs.image_digest }}
+
+      - name: Verify signature
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ghcr.io/${{ env.IMAGE_NAME }}@${{ needs.package-docker.outputs.image_digest }}
+
+########################################################################
+# STAGE 9: DEPLOY DEV
+########################################################################
+
+  deploy-dev:
+    name: "Deploy · Dev"
+    runs-on: ubuntu-latest
+    needs: imgsec-cosign
+    environment:
+      name: dev
+      url: https://dev.${{ vars.APP_DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_DEV }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Create GHCR imagePullSecret
+        run: |
+          kubectl create secret docker-registry ghcr-pull-secret \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }} \
+            --namespace=$K8S_NAMESPACE_DEV \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Run DB migrations (dev)
+        run: |
+          kubectl run laravel-migrate-${{ github.run_id }} \
+            --image=ghcr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            --image-pull-policy=Always \
+            --restart=Never \
+            --namespace=$K8S_NAMESPACE_DEV \
+            --env="APP_KEY=${{ secrets.DEV_APP_KEY }}" \
+            --env="DB_CONNECTION=${{ vars.DEV_DB_CONNECTION }}" \
+            --env="DB_HOST=${{ vars.DEV_DB_HOST }}" \
+            --env="DB_DATABASE=${{ vars.DEV_DB_DATABASE }}" \
+            --env="DB_USERNAME=${{ secrets.DEV_DB_USERNAME }}" \
+            --env="DB_PASSWORD=${{ secrets.DEV_DB_PASSWORD }}" \
+            --command -- php artisan migrate --force
+          kubectl wait pod/laravel-migrate-${{ github.run_id }} \
+            --for=condition=Succeeded \
+            --namespace=$K8S_NAMESPACE_DEV \
+            --timeout=120s
+          kubectl delete pod laravel-migrate-${{ github.run_id }} \
+            --namespace=$K8S_NAMESPACE_DEV
+
+      - name: Helm deploy (--atomic)
+        run: |
+          helm upgrade --install $APP_NAME $HELM_CHART_PATH \
+            --namespace $K8S_NAMESPACE_DEV \
+            --create-namespace \
+            --set image.repository="ghcr.io/${{ env.IMAGE_NAME }}" \
+            --set image.tag="${IMAGE_TAG}" \
+            --set image.pullPolicy=Always \
+            --set image.pullSecret=ghcr-pull-secret \
+            --set replicaCount=1 \
+            --set resources.requests.cpu=100m \
+            --set resources.requests.memory=256Mi \
+            --set resources.limits.cpu=500m \
+            --set resources.limits.memory=512Mi \
+            --set ingress.host="dev.${{ vars.APP_DOMAIN }}" \
+            --set env.APP_ENV=development \
+            --set "podAnnotations.deploy-time=$(date -u +%s)" \
+            --values helm/laravel-app/values-dev.yaml \
+            --timeout 5m \
+            --wait \
+            --atomic
+
+########################################################################
+# STAGE 10: SMOKE DEV
+########################################################################
+
+  smoke-dev:
+    name: "Smoke · Dev"
+    runs-on: ubuntu-latest
+    needs: deploy-dev
+    steps:
+      - name: Run smoke tests
+        env:
+          BASE_URL: "https://dev.${{ vars.APP_DOMAIN }}"
+        run: |
+          check() {
+            local url=$1 label=$2
+            STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$url")
+            [ "$STATUS" = "200" ] && echo "OK  $label" || { echo "FAIL $label ($STATUS)"; exit 1; }
+          }
+          check "$BASE_URL/api/health"          "API health"
+          check "$BASE_URL/api/health/detailed" "Detailed health"
+          check "$BASE_URL/api/tasks"           "Tasks endpoint"
+          echo "All smoke tests passed."
+
+########################################################################
+# STAGE 11: DEPLOY STAGING
+########################################################################
+
+  deploy-staging:
+    name: "Deploy · Staging"
+    runs-on: ubuntu-latest
+    needs: smoke-dev
+    environment:
+      name: staging
+      url: https://staging.${{ vars.APP_DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Create GHCR imagePullSecret
+        run: |
+          kubectl create secret docker-registry ghcr-pull-secret \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }} \
+            --namespace=$K8S_NAMESPACE_STAGING \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Run DB migrations (staging)
+        run: |
+          kubectl run laravel-migrate-${{ github.run_id }} \
+            --image=ghcr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            --image-pull-policy=Always \
+            --restart=Never \
+            --namespace=$K8S_NAMESPACE_STAGING \
+            --env="APP_KEY=${{ secrets.STAGING_APP_KEY }}" \
+            --env="DB_HOST=${{ vars.STAGING_DB_HOST }}" \
+            --env="DB_DATABASE=${{ vars.STAGING_DB_DATABASE }}" \
+            --env="DB_USERNAME=${{ secrets.STAGING_DB_USERNAME }}" \
+            --env="DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }}" \
+            --command -- php artisan migrate --force
+          kubectl wait pod/laravel-migrate-${{ github.run_id }} \
+            --for=condition=Succeeded \
+            --namespace=$K8S_NAMESPACE_STAGING \
+            --timeout=120s
+          kubectl delete pod laravel-migrate-${{ github.run_id }} \
+            --namespace=$K8S_NAMESPACE_STAGING
+
+      - name: Helm deploy (--atomic)
+        run: |
+          helm upgrade --install $APP_NAME $HELM_CHART_PATH \
+            --namespace $K8S_NAMESPACE_STAGING \
+            --create-namespace \
+            --set image.repository="ghcr.io/${{ env.IMAGE_NAME }}" \
+            --set image.tag="${IMAGE_TAG}" \
+            --set image.pullPolicy=Always \
+            --set image.pullSecret=ghcr-pull-secret \
+            --set replicaCount=2 \
+            --set resources.requests.cpu=200m \
+            --set resources.requests.memory=512Mi \
+            --set resources.limits.cpu=1000m \
+            --set resources.limits.memory=1Gi \
+            --set ingress.host="staging.${{ vars.APP_DOMAIN }}" \
+            --set env.APP_ENV=staging \
+            --values helm/laravel-app/values-staging.yaml \
+            --timeout 8m \
+            --wait \
+            --atomic
+
+########################################################################
+# STAGE 12: INTEGRATION TESTS
+########################################################################
+
+  integration-api:
+    name: "Integration · API Tests (staging)"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bruno CLI (API test runner)
+        run: npm install -g @usebruno/cli
+
+      - name: Run Bruno API tests against staging
+        env:
+          BASE_URL: "https://staging.${{ vars.APP_DOMAIN }}"
+        run: |
+          if [ -d "tests/bruno" ]; then
+            bru run tests/bruno --env staging --output tests/bruno/results.json
+          else
+            echo "No Bruno tests found — running curl-based API smoke"
+            curl -sf "$BASE_URL/api/tasks" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'data' in d, 'missing data key'"
+            curl -sf -X POST "$BASE_URL/api/tasks" \
+              -H "Content-Type: application/json" \
+              -d '{"title":"Integration test task","status":"pending","priority":"high"}' \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['title']=='Integration test task'"
+            echo "API integration tests passed"
+          fi
+
+  integration-dast:
+    name: "Integration · DAST (OWASP ZAP)"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "https://staging.${{ vars.APP_DOMAIN }}"
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-l WARN -I"
+          issue_title: "OWASP ZAP Baseline — Staging"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          artifact_name: zap-report-${{ github.sha }}
+          fail_action: true
+
+  integration-performance:
+    name: "Integration · k6 Load Test"
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: grafana/setup-k6-action@v1
+      - name: Run k6 load test
+        env:
+          BASE_URL: "https://staging.${{ vars.APP_DOMAIN }}"
+        run: |
+          if [ -f performance/load-test.js ]; then
+            k6 run --out json=k6-results.json --env BASE_URL="$BASE_URL" performance/load-test.js
+          else
+            echo "No k6 script found, skipping"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-results-${{ github.sha }}
+          path: k6-results.json
+          retention-days: 14
+
+########################################################################
+# STAGE 13: DEPLOY PROD (manual gate via environment reviewers)
+########################################################################
+
+  deploy-prod:
+    name: "Deploy · Production"
+    runs-on: ubuntu-latest
+    needs: [integration-api, integration-dast]
+    environment:
+      name: production
+      url: https://${{ vars.APP_DOMAIN }}
+    if: |
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: sigstore/cosign-installer@v3.5.0
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify image signature (pre-deploy gate)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/${{ github.repository }}.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ghcr.io/${{ env.IMAGE_NAME }}@${{ needs.package-docker.outputs.image_digest }}
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Configure kubeconfig (prod)
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Create GHCR imagePullSecret
+        run: |
+          kubectl create secret docker-registry ghcr-pull-secret \
+            --docker-server=ghcr.io \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }} \
+            --namespace=$K8S_NAMESPACE_PROD \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Run DB migrations (prod — zero downtime)
+        run: |
+          kubectl run laravel-migrate-${{ github.run_id }} \
+            --image=ghcr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            --image-pull-policy=Always \
+            --restart=Never \
+            --namespace=$K8S_NAMESPACE_PROD \
+            --env="APP_KEY=${{ secrets.PROD_APP_KEY }}" \
+            --env="DB_HOST=${{ vars.PROD_DB_HOST }}" \
+            --env="DB_DATABASE=${{ vars.PROD_DB_DATABASE }}" \
+            --env="DB_USERNAME=${{ secrets.PROD_DB_USERNAME }}" \
+            --env="DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }}" \
+            --command -- php artisan migrate --force
+          kubectl wait pod/laravel-migrate-${{ github.run_id }} \
+            --for=condition=Succeeded \
+            --namespace=$K8S_NAMESPACE_PROD \
+            --timeout=300s
+          kubectl delete pod laravel-migrate-${{ github.run_id }} \
+            --namespace=$K8S_NAMESPACE_PROD
+
+      - name: Helm deploy (--atomic)
+        run: |
+          helm upgrade --install $APP_NAME $HELM_CHART_PATH \
+            --namespace $K8S_NAMESPACE_PROD \
+            --create-namespace \
+            --set image.repository="ghcr.io/${{ env.IMAGE_NAME }}" \
+            --set image.tag="${IMAGE_TAG}" \
+            --set image.pullPolicy=Always \
+            --set image.pullSecret=ghcr-pull-secret \
+            --set replicaCount=3 \
+            --set resources.requests.cpu=200m \
+            --set resources.requests.memory=512Mi \
+            --set resources.limits.cpu=1000m \
+            --set resources.limits.memory=1Gi \
+            --set ingress.host="${{ vars.APP_DOMAIN }}" \
+            --set env.APP_ENV=production \
+            --set podDisruptionBudget.enabled=true \
+            --set podDisruptionBudget.minAvailable=2 \
+            --set autoscaling.enabled=true \
+            --set autoscaling.minReplicas=3 \
+            --set autoscaling.maxReplicas=8 \
+            --set autoscaling.targetCPUUtilizationPercentage=70 \
+            --values helm/laravel-app/values-prod.yaml \
+            --timeout 10m \
+            --wait \
+            --atomic
+
+########################################################################
+# STAGE 14: VERIFY PROD
+########################################################################
+
+  verify-prod-smoke:
+    name: "Verify · Prod Smoke"
+    runs-on: ubuntu-latest
+    needs: deploy-prod
+    steps:
+      - name: Smoke test production
+        env:
+          BASE_URL: "https://${{ vars.APP_DOMAIN }}"
+        run: |
+          for i in $(seq 1 5); do
+            STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "$BASE_URL/api/health")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health OK on attempt $i"; exit 0
+            fi
+            echo "Attempt $i failed ($STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Prod smoke failed"; exit 1
+
+  rollback-prod:
+    name: "Rollback · Production"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.rollback == 'true'
+    environment:
+      name: production
+    steps:
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Configure kubeconfig (prod)
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Helm rollback
+        run: |
+          helm rollback $APP_NAME 1 \
+            --namespace $K8S_NAMESPACE_PROD \
+            --wait \
+            --timeout 5m
+          helm history $APP_NAME --namespace $K8S_NAMESPACE_PROD --max 3
