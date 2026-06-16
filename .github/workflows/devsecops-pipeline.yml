@@ -311,7 +311,7 @@ jobs:
           path: vendor/
 
       - name: Run PHPStan static analysis
-        run: vendor/bin/phpstan analyse --error-format=github --no-progress
+        run: vendor/bin/phpstan analyse --error-format=github --no-progress --memory-limit=1G
 
   sast-pint:
     name: "SAST · Pint Code Style"
