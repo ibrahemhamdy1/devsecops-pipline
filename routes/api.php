@@ -6,7 +6,7 @@ use Illuminate\Support\Facades\Route;
 
 // Health endpoints (no auth required)
 Route::prefix('health')->group(function () {
-    Route::get('/',        [HealthController::class, 'index'])->name('health.index');
+    Route::get('/', [HealthController::class, 'index'])->name('health.index');
     Route::get('/detailed', [HealthController::class, 'detailed'])->name('health.detailed');
 });
 

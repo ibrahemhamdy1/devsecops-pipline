@@ -11,9 +11,9 @@ class HealthController extends Controller
     public function index(): JsonResponse
     {
         return response()->json([
-            'status'  => 'ok',
+            'status' => 'ok',
             'service' => config('app.name'),
-            'env'     => config('app.env'),
+            'env' => config('app.env'),
             'version' => config('app.version', '1.0.0'),
         ]);
     }

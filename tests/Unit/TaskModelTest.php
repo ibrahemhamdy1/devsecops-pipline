@@ -32,7 +32,7 @@ test('highPriority scope filters correctly', function () {
 });
 
 test('task has correct fillable attributes', function () {
-    $task = new Task();
+    $task = new Task;
 
     expect($task->getFillable())->toContain('title')
         ->toContain('status')

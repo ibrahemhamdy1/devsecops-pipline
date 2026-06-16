@@ -7,6 +7,7 @@ use App\Http\Requests\UpdateTaskRequest;
 use App\Models\Task;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Resources\Json\JsonResource;
 
 class TaskController extends Controller
 {
@@ -17,7 +18,7 @@ class TaskController extends Controller
             ->latest()
             ->paginate(15);
 
-        return response()->json($tasks);
+        return JsonResource::collection($tasks)->response();
     }
 
     public function store(StoreTaskRequest $request): JsonResponse

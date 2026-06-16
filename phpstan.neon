@@ -1,8 +1,10 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
 parameters:
     level: 8
     paths:
         - app
     excludePaths:
-        - app/Http/Middleware/TrustProxies.php
+        - app/Http/Middleware/TrustProxies.php (?)
     ignoreErrors: []
-    checkMissingIterableValueType: false
